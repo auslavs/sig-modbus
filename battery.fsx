@@ -4,6 +4,7 @@
 
 open System
 open System.Net.Sockets
+open System.Threading
 open System.Threading.Tasks
 open NModbus
 open FsToolkit.ErrorHandling
@@ -311,21 +312,78 @@ let readBatteryReport (master: IModbusMaster) : Task<Result<BatteryReport, strin
     return { Plant = plantData; Inverter = inverterData }
   }
 
-let run () =
-  task {
-    match! createConnection config with
-    | Error e -> return Error e
-    | Ok (client, master) ->
-      try
-        return! readBatteryReport master
-      finally
-        client.Dispose()
-  }
+let refreshInterval = 10
 
-match run () |> Async.AwaitTask |> Async.RunSynchronously with
-| Ok report ->
-  printReport report
-| Error msg ->
-  let escaped = Markup.Escape msg
-  AnsiConsole.MarkupLine $"[red bold]Error:[/] [red]{escaped}[/]"
-  exit 1
+let showLoadingScreen () =
+  Console.Clear()
+  AnsiConsole.Write(FigletText("SigEnStor").Color(Color.Green))
+  AnsiConsole.MarkupLine $"[dim]Connecting to {config.Host}:{config.Port}...[/]"
+
+let showAgeCountdown (cts: CancellationToken) =
+  let mutable age = 0
+  while age < refreshInterval && not cts.IsCancellationRequested do
+    let cursorLeft, cursorTop = Console.CursorLeft, Console.CursorTop
+    AnsiConsole.Markup $"[dim]Data is {age}s old — Refreshes every {refreshInterval}s — Ctrl+C to quit[/]"
+    Thread.Sleep(1000)
+    Console.SetCursorPosition(cursorLeft, cursorTop)
+    Console.Write(String.replicate 80 " ")
+    Console.SetCursorPosition(cursorLeft, cursorTop)
+    age <- age + 1
+
+let run () =
+  use cts = new CancellationTokenSource()
+  Console.CancelKeyPress.Add(fun args ->
+    args.Cancel <- true
+    cts.Cancel())
+
+  showLoadingScreen ()
+
+  let mutable connection: (TcpClient * IModbusMaster) option = None
+
+  let ensureConnection () =
+    task {
+      match connection with
+      | Some c -> return Ok c
+      | None ->
+        match! createConnection config with
+        | Ok c ->
+          connection <- Some c
+          return Ok c
+        | Error e -> return Error e
+    }
+
+  let disposeConnection () =
+    match connection with
+    | Some(client, _) ->
+      try client.Dispose() with _ -> ()
+      connection <- None
+    | None -> ()
+
+  try
+    while not cts.Token.IsCancellationRequested do
+      let result =
+        task {
+          match! ensureConnection () with
+          | Error e -> return Error e
+          | Ok(_, master) -> return! readBatteryReport master
+        }
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
+      Console.Clear()
+      match result with
+      | Ok report ->
+        printReport report
+        AnsiConsole.WriteLine()
+        showAgeCountdown cts.Token
+      | Error msg ->
+        disposeConnection ()
+        AnsiConsole.Write(FigletText("SigEnStor").Color(Color.Green))
+        let escaped = Markup.Escape msg
+        AnsiConsole.MarkupLine $"[red bold]Error:[/] [red]{escaped}[/]"
+        AnsiConsole.MarkupLine $"[dim]Retrying in {refreshInterval}s...[/]"
+        Thread.Sleep(refreshInterval * 1000)
+  finally
+    disposeConnection ()
+
+run ()
